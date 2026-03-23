@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'unsafe-inline' https://www.gstatic.com; style-src 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src * data: blob:; connect-src https://*.firebaseio.com wss://*.firebaseio.com https://api.groupme.com; object-src 'none'; base-uri 'self'; form-action 'self';">
 <title>Stake Youth Planner</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500&family=DM+Serif+Display&display=swap" rel="stylesheet">
@@ -662,14 +663,19 @@ function fmtDate(d) {
   if(!d) return { month:'', day:'', full:'' };
   const [y,m,dd] = d.split('-');
   const MOS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return { month: MOS[+m-1], day: +dd, full: `${MOS[+m-1]} ${+dd}, ${y}` };
+  const mo = MOS[+m-1] || ''; const dy = +dd || '';
+  // esc(y) guards against XSS if a malicious year string enters via import or Firebase
+  return { month: mo, day: dy, full: mo ? `${mo} ${dy}, ${esc(y)}` : '' };
 }
 
 function fmt12(t) {
   if(!t) return '';
   const [h,m] = t.split(':');
-  const hr = +h; const ampm = hr>=12?'pm':'am';
-  return `${hr%12||12}:${m}${ampm}`;
+  const hr = +h;
+  if(isNaN(hr)) return '';
+  const ampm = hr>=12?'pm':'am';
+  // esc(m) guards against XSS if minutes contain unexpected characters from imported data
+  return `${hr%12||12}:${esc(m||'')}${ampm}`;
 }
 
 // ── PERSISTENCE ────────────────────────────────────────────────────────────
@@ -717,6 +723,27 @@ function exportData() {
   toast('Data exported!');
 }
 
+// IDs produced by uid() are lowercase base-36 alphanumeric; reject anything that deviates
+// to prevent injected IDs from escaping the onclick="…('${id}')…" attribute context.
+const SAFE_ID_RE = /^[a-z0-9]{1,30}$/i;
+
+function validateImport(d) {
+  if(!d || typeof d !== 'object' || Array.isArray(d)) return false;
+  for(const key of ['events','actions','people','customRoles']) {
+    const arr = d[key];
+    if(arr !== undefined && !Array.isArray(arr)) return false;
+    if(Array.isArray(arr)) {
+      for(const item of arr) {
+        if(!item || typeof item !== 'object' || Array.isArray(item)) return false;
+        if(item.id !== undefined && !SAFE_ID_RE.test(String(item.id))) return false;
+      }
+    }
+  }
+  if(d.webhook !== undefined && typeof d.webhook !== 'string') return false;
+  if(d.botId   !== undefined && typeof d.botId   !== 'string') return false;
+  return true;
+}
+
 function importData(e) {
   const file = e.target.files[0]; if(!file) return;
   if(!confirm('This will replace ALL current data with the imported file. Continue?')) { e.target.value=''; return; }
@@ -724,11 +751,13 @@ function importData(e) {
   r.onload = ev => {
     try {
       const d = JSON.parse(ev.target.result);
+      if(!validateImport(d)) { alert('Import rejected: file contains invalid or unsafe data.'); return; }
       events = d.events||[]; actions = d.actions||[];
       people = d.people||[]; customRoles = d.customRoles||[];
-      webhook = d.webhook||''; botId = d.botId||'';
+      webhook = typeof d.webhook === 'string' ? d.webhook : '';
+      botId   = typeof d.botId   === 'string' ? d.botId   : '';
       if(webhook) document.getElementById('gm-webhook').value = webhook;
-      if(botId) document.getElementById('gm-botid').value = botId;
+      if(botId)   document.getElementById('gm-botid').value   = botId;
       save(); renderAll(); toast('Data imported!');
     } catch(err) { alert('Could not read file. Make sure it is a valid export.'); }
   };
@@ -759,9 +788,11 @@ function showTab(t, btn) {
 }
 
 function updateStats() {
+  let open = 0, done = 0;
+  for(const a of actions) { if(a.done) done++; else open++; }
   document.getElementById('s-events').textContent = events.length;
-  document.getElementById('s-open').textContent   = actions.filter(a=>!a.done).length;
-  document.getElementById('s-done').textContent   = actions.filter(a=>a.done).length;
+  document.getElementById('s-open').textContent   = open;
+  document.getElementById('s-done').textContent   = done;
   document.getElementById('s-people').textContent = people.length;
 }
 
@@ -812,11 +843,12 @@ function dashEventCard(ev, today) {
   const doneCount = evActions.length - openActions.length;
   const timeFmt = fmt12(ev.time);
   const isPast = ev.date && ev.date < today;
+  const allR = allRoles(); // cache once per card instead of once per task row
 
   const taskRows = openActions.length
     ? openActions.map(a => {
         const person = people.find(p => p.id === a.personId);
-        const role   = allRoles().find(r => r.id === a.roleId);
+        const role   = allR.find(r => r.id === a.roleId);
         const due    = fmtDate(a.due);
         const overdue = isOverdue(a.due);
         return `<div class="dash-task-row">
@@ -1039,8 +1071,9 @@ function renderActions() {
   }
 
   const priColor = { High:'b-coral', Normal:'b-gray', Low:'b-gray' };
+  const allR = allRoles(); // cache once for the entire render pass
   const personOpts = people.map(p=>`<option value="${p.id}">${esc(p.name)}</option>`).join('');
-  const roleOpts   = allRoles().map(r=>`<option value="${r.id}">${esc(r.name)}</option>`).join('');
+  const roleOpts   = allR.map(r=>`<option value="${r.id}">${esc(r.name)}</option>`).join('');
   const eventOpts  = events.map(e=>`<option value="${e.id}">${esc(e.name)}</option>`).join('');
 
   el.innerHTML = list.map(a => {
@@ -1055,7 +1088,7 @@ function renderActions() {
           </div>
           <div class="form-grid g3">
             <div class="fg"><label>Role</label>
-              <select id="ea-role"><option value="">— any role —</option>${allRoles().map(r=>`<option value="${r.id}" ${r.id===a.roleId?'selected':''}>${esc(r.name)}</option>`).join('')}</select>
+              <select id="ea-role"><option value="">— any role —</option>${allR.map(r=>`<option value="${r.id}" ${r.id===a.roleId?'selected':''}>${esc(r.name)}</option>`).join('')}</select>
             </div>
             <div class="fg"><label>Event</label>
               <select id="ea-event"><option value="">— no event —</option>${events.map(e=>`<option value="${e.id}" ${e.id===a.eventId?'selected':''}>${esc(e.name)}</option>`).join('')}</select>
@@ -1077,7 +1110,7 @@ function renderActions() {
 
     const person = people.find(p => p.id === a.personId);
     const ev     = events.find(e => e.id === a.eventId);
-    const role   = allRoles().find(r => r.id === a.roleId);
+    const role   = allR.find(r => r.id === a.roleId);
     const d      = fmtDate(a.due);
     const pc     = priColor[a.priority] || 'b-gray';
     const overdue = !a.done && isOverdue(a.due);
@@ -1288,8 +1321,16 @@ function renderRoles() {
 
 // ── GROUPME ────────────────────────────────────────────────────────────────
 function saveWebhook() {
-  webhook = document.getElementById('gm-webhook').value.trim();
-  botId   = document.getElementById('gm-botid').value.trim();
+  const rawUrl   = document.getElementById('gm-webhook').value.trim();
+  const rawBotId = document.getElementById('gm-botid').value.trim();
+  if(rawUrl) {
+    try {
+      const u = new URL(rawUrl);
+      if(u.protocol !== 'https:') { alert('Webhook URL must use HTTPS.'); return; }
+    } catch { alert('Please enter a valid webhook URL.'); return; }
+  }
+  webhook = rawUrl;
+  botId   = rawBotId;
   save(); toast('Webhook saved!');
 }
 
@@ -1336,14 +1377,10 @@ function generateMsg() {
 function copyMsg() {
   const text = document.getElementById('gm-preview').textContent;
   if(text === 'Select an event above to generate a message.') return;
+  // navigator.clipboard is available in all modern browsers served over HTTPS
   navigator.clipboard.writeText(text)
     .then(() => toast('Message copied!'))
-    .catch(() => {
-      const ta = document.createElement('textarea');
-      ta.value = text; document.body.appendChild(ta); ta.select();
-      document.execCommand('copy'); document.body.removeChild(ta);
-      toast('Message copied!');
-    });
+    .catch(() => toast('Copy failed — please select and copy manually.'));
 }
 
 async function sendToGroupMe() {
@@ -1355,6 +1392,12 @@ async function sendToGroupMe() {
     setTimeout(() => status.textContent = '', 4000); return;
   }
   if(text === 'Select an event above to generate a message.') return;
+  // Re-validate the stored webhook before sending to prevent SSRF
+  try { const u = new URL(webhook); if(u.protocol !== 'https:') throw new Error(); }
+  catch {
+    status.style.color = 'var(--coral-600)'; status.textContent = 'Invalid webhook URL — must be HTTPS.';
+    setTimeout(() => status.textContent = '', 4000); return;
+  }
   status.style.color = 'var(--text-2)'; status.textContent = 'Posting…';
   try {
     const res = await fetch(webhook, {
