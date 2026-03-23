@@ -1,0 +1,10 @@
+{
+  "rules": {
+    "planner": {
+      // Only authenticated users can read or write planning data.
+      // This prevents anonymous access to events, people, and contact info.
+      ".read":  "auth != null",
+      ".write": "auth != null"
+    }
+  }
+}
